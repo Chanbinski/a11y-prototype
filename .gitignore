@@ -5,6 +5,7 @@ node_modules/
 .eslintcache
 .stylelintcache
 *.egg-info/
+test_notebooks/
 .ipynb_checkpoints
 *.tsbuildinfo
 a11y_prototype/labextension
