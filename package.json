@@ -57,7 +57,7 @@
         "@jupyterlab/notebook": "^4.3.5",
         "@lumino/widgets": "^2.6.0",
         "axe-core": "^4.10.2",
-        "axios": "^1.7.9"
+        "axios": "^1.8.1"
     },
     "devDependencies": {
         "@jupyterlab/builder": "^4.0.0",

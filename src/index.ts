@@ -2,9 +2,16 @@ import { JupyterFrontEnd, JupyterFrontEndPlugin } from '@jupyterlab/application'
 import { NotebookPanel } from '@jupyterlab/notebook';
 import { Widget } from '@lumino/widgets';
 import { LabIcon } from '@jupyterlab/ui-components';
-import axe from 'axe-core';
 import { ILabShell } from '@jupyterlab/application';
+import { PageConfig } from '@jupyterlab/coreutils';
+import { ServerConnection } from '@jupyterlab/services';
+import axe from 'axe-core';
+import axios from 'axios';
 
+// Track if model has been pulled
+let isModelPulled = false;
+
+// Types and Interfaces
 interface CellAccessibilityIssue {
     cellIndex: number;
     cellType: string;
@@ -12,9 +19,7 @@ interface CellAccessibilityIssue {
     contentRaw: string;
 }
 
-/**
- * Extract HTML content from each cell in the notebook, run axe-core on it, and return the issues.
- */
+// Core Analysis Functions
 async function analyzeCellsAccessibility(panel: NotebookPanel): Promise<CellAccessibilityIssue[]> {
     const issues: CellAccessibilityIssue[] = [];
     
@@ -23,7 +28,6 @@ async function analyzeCellsAccessibility(panel: NotebookPanel): Promise<CellAcce
 
     const axeConfig: axe.RunOptions = {
         runOnly: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'],
-        rules: {'button-name': { enabled: false }} // Disable button-name rule, should add more rules that are irrelevant.
     };
 
     try {
@@ -35,28 +39,44 @@ async function analyzeCellsAccessibility(panel: NotebookPanel): Promise<CellAcce
                 continue;
             }
 
-            let output;
             const cellType = cell.model.type;
             if (cellType === 'markdown') {
-                output = cell.node.querySelector('.jp-MarkdownOutput')
-            } else if (cellType === 'code') {
-                output = cell.node.querySelector('.jp-OutputArea')
-            }
+                const markdownOutput = cell.node.querySelector('.jp-MarkdownOutput')
+                if (markdownOutput) {
+                    // First check rendered markdown
+                    tempDiv.innerHTML = markdownOutput.innerHTML;
+                    if (tempDiv.innerHTML.trim()) {
+                        const renderedResults = await axe.run(tempDiv, axeConfig);
+                        const renderedViolations = renderedResults.violations;
 
-            if (output) {
-                tempDiv.innerHTML = output.innerHTML;
-                if (tempDiv.innerHTML.trim()) {
-                    const results = await axe.run(tempDiv, axeConfig);
-                    if (results.violations.length > 0) {
-                        issues.push({
-                            cellIndex: i,
-                            cellType: cellType,
-                            axeResults: results.violations,
-                            contentRaw: cell.model.sharedModel.getSource(),
-                        });
+                        // Then check raw markdown
+                        tempDiv.innerHTML = cell.model.sharedModel.getSource();
+                        const rawResults = await axe.run(tempDiv, axeConfig);
+                        const rawViolations = rawResults.violations;
+
+                        // Combine violations and filter duplicates based on issue ID
+                        const allViolations = [...renderedViolations, ...rawViolations];
+                        const uniqueViolations = allViolations.filter((violation, index, self) =>
+                            index === self.findIndex(v => v.id === violation.id)
+                        );
+
+                        if (uniqueViolations.length > 0) {
+                            issues.push({
+                                cellIndex: i,
+                                cellType: cellType,
+                                axeResults: uniqueViolations,
+                                contentRaw: cell.model.sharedModel.getSource(),
+                            });
+                        }
                     }
                 }
-            } 
+            } else if (cellType === 'code') {
+                const codeInput = cell.node.querySelector('.jp-InputArea-editor')
+                const codeOutput = cell.node.querySelector('.jp-OutputArea')
+                if (codeInput || codeOutput) {
+                    // We would have to feed this into a language model to get the suggested fix.
+                }
+            }
         }
     } finally {
         tempDiv.remove();
@@ -65,9 +85,7 @@ async function analyzeCellsAccessibility(panel: NotebookPanel): Promise<CellAcce
     return issues;
 }
 
-/**
- * Format accessibility issues to feed into a language model.
- */
+// AI Integration Functions
 function formatPrompt(issue: CellAccessibilityIssue): string {
     let prompt = `The following represents a jupyter notebook cell and a accessibility issue found in it.\n\n`;
 
@@ -78,75 +96,100 @@ function formatPrompt(issue: CellAccessibilityIssue): string {
         prompt += `Description: ${issue.description}\n\n`;
     });
 
+    prompt += `Respond in JSON format with the following fields:
+    - exampleCellContent: A suggested fix for the cell, without any explanation.
+    - explanation: An explanation of the issue and the suggested fix.
+    `;
+
     return prompt;
 }
 
-/**
-* Send issues to Ollama for suggestions
-*/
-async function getFixSuggestions(prompt: string): Promise<string[]> {
-    const OLLAMA_API = "http://localhost:11434/api/generate";
-
-    let body = JSON.stringify({ 
-        model: "mistral",
-        prompt: prompt,
-        stream: false
-    })
-    
+async function getFixSuggestions(prompt: string, userURL: string, modelName: string): Promise<string[]> {
     try {
-        const response = await fetch(OLLAMA_API, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: body
-        });
-
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+        // Only pull model on first API call
+        if (!isModelPulled) {
+            await pullOllamaModel(userURL, modelName);
+            console.log("Model pulled");
+            isModelPulled = true;
         }
-
-        const responseText = await response.text();
-        const responseObj = JSON.parse(responseText);    
+        
+        let body = JSON.stringify({ 
+            model: modelName,
+            prompt: prompt,
+            stream: false
+        });
+        
+        const response = await axios.post(
+            userURL + "api/generate",
+            body,
+            {
+              headers: { 'Content-Type': 'application/json' }
+            }
+        );
+        const responseText = await response.data.response.trim();
+        const responseObj = JSON.parse(responseText); 
+        console.log(responseText)   
         try {
-            // Parse the actual JSON content from the response
-            const rawJSONString = responseObj.response
-            .replace(/```json\n/, '')
-            .replace(/\n```/, '')
-            .trim();
-
-
-            const result = JSON.parse(rawJSONString);
-            return [result.exampleCellContent || '', result.explanation || ''];
+            return [responseObj.exampleCellContent || '', responseObj.explanation || ''];
         } catch (e) {
             console.error('Failed to parse suggestion:', e);
             return ['Invalid response format', ''];
         }
     } catch (error) {
         console.error('Error getting suggestions:', error);
-        return ['Error analyzing accessibility issues', ''];
+        return ['Error', ''];
     }
 }
 
+async function pullOllamaModel(userURL: string, modelName: string): Promise<void> {
+    try {
+      const payload = {
+        name: modelName,
+        stream: false,
+        options: {
+          low_cpu_mem_usage: true,
+          use_fast_tokenizer: true,
+        }
+      };
+  
+      // Instead of aborting, let's just monitor the time
+      console.log("Starting model pull...");
+  
+      const response = await axios.post(
+        userURL + "api/pull",
+        payload,
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+  
+      if (response.status !== 200) {
+        throw new Error('Failed to pull model');
+      }
+    } catch (error) {
+      console.error('Error pulling model:', error);
+      throw error;
+    }
+}
+  
 
-/**
-* Frontend UI for individual cell issues.
-*/
+// UI Components
 class CellIssueWidget extends Widget {
     private currentNotebook: NotebookPanel | null = null;
     private cellIndex: number;
     private suggestion: string = '';
+    private _userOllamaUrl: string;
 
     constructor(issue: CellAccessibilityIssue, notebook: NotebookPanel) {
         super();
         this.addClass('jp-A11yPanel-issue');
         this.currentNotebook = notebook;
         this.cellIndex = issue.cellIndex;
-
+        this._userOllamaUrl = (ServerConnection.makeSettings().baseUrl || PageConfig.getBaseUrl()) + "ollama/";
         // Header Container UI
         const buttonContainer = document.createElement('div');
         buttonContainer.innerHTML = `
             <div class="jp-A11yPanel-buttonContainer">
-                <button class="jp-Button">
-                Cell error: ${issue.axeResults.map((result: any) => result.id).join(', ')}
+                <button class="jp-text-button jp-level1 jp-MainIssueButton">
+                Issue: ${issue.axeResults.map((result: any) => result.id).join(', ')}
                 </button>
                 <span class="jp-A11yPanel-infoIcon">&#9432;</span>
                 <div class="jp-A11yPanel-popup">
@@ -163,9 +206,27 @@ class CellIssueWidget extends Widget {
                     .join('')}
                 </div>
             </div>
+            <div class="jp-level2-buttons" style="display: none;">
+                <button class="jp-text-button jp-level2 jp-NavigateToCellButton">Navigate to cell</button>
+                <div class="jp-A11yPanel-buttonContainer suggestion-header">
+                    <button class="jp-text-button jp-level2 jp-GetSuggestionsButton">Get AI Suggestions</button>
+                    <span class="jp-A11yPanel-infoIcon" style="display: none;">&#9432;</span>
+                    <div class="jp-A11yPanel-explanationContent jp-A11yPanel-popup" style="display: none;"></div>
+                </div>
+            </div>
             `;
-        const button = buttonContainer.querySelector('.jp-Button') as HTMLButtonElement;
-        button.onclick = () => this.navigateToCell(issue.cellIndex);
+
+        // Add click handler for main issue button to toggle level2 buttons
+        const mainButton = buttonContainer.querySelector('.jp-MainIssueButton') as HTMLButtonElement;
+        const level2Buttons = buttonContainer.querySelector('.jp-level2-buttons') as HTMLElement;
+        mainButton.onclick = () => {
+            level2Buttons.style.display = level2Buttons.style.display === 'none' ? 'block' : 'none';
+            suggestionContainer.style.display = 'none';
+        };
+
+        // Rest of the click handlers
+        const navigateButton = buttonContainer.querySelector('.jp-NavigateToCellButton') as HTMLButtonElement;
+        navigateButton.onclick = () => this.navigateToCell(issue.cellIndex);
 
         const infoIcon = buttonContainer.querySelector('.jp-A11yPanel-infoIcon') as HTMLElement;
         infoIcon.onclick = () => {
@@ -175,67 +236,103 @@ class CellIssueWidget extends Widget {
 
         // AI Suggestion Container UI
         const suggestionContainer = document.createElement('div');
+        suggestionContainer.style.display = 'none';
         suggestionContainer.innerHTML = `
           <div class="jp-A11yPanel-suggestionContainer">
-            <div class="jp-A11yPanel-suggestionTop">
-              <div class="jp-A11yPanel-label">AI Suggestion</div>
-              <span class="jp-Icon jp-ChevronIcon"></span>
+            <div class="jp-level4 jp-A11yPanel-loading" style="display: none;">
+              Please wait...
             </div>
-            <div class="jp-A11yPanel-suggestion"></div>
-            <div class="jp-A11yPanel-controls">
-                <button class="jp-A11yPanel-applyButton">
-                    Apply
-                <span class="jp-Icon jp-CheckIcon"></span>
-                </button>
-            </div>
-            <div class="jp-A11yPanel-explanationPopup"></div>
+            <div class="jp-level3 jp-A11yPanel-suggestion" style="display: none;"></div>
+            <button class="jp-level3 jp-text-button jp-A11yPanel-applyButton" style="display: none;">Apply</button>
           </div>
         `;
 
+        // Add click handler for Get AI Suggestions button
+        const getSuggestionsButton = buttonContainer.querySelector('.jp-GetSuggestionsButton') as HTMLButtonElement;
+        getSuggestionsButton.onclick = async () => {
+            suggestionContainer.style.display = 'block';
+            const loadingElement = suggestionContainer.querySelector('.jp-A11yPanel-loading') as HTMLElement;
+            const aiSuggestion = suggestionContainer.querySelector('.jp-A11yPanel-suggestion') as HTMLElement;
+            
+            const suggestionHeader = buttonContainer.querySelector('.suggestion-header') as HTMLElement;
+
+
+            const explanationContent = suggestionHeader.querySelector('.jp-A11yPanel-explanationContent') as HTMLElement;
+            const infoIcon = suggestionHeader.querySelector('.jp-A11yPanel-infoIcon') as HTMLElement;
+            const applyButton = suggestionContainer.querySelector('.jp-A11yPanel-applyButton') as HTMLElement;
+            
+            // Show loading state, hide everything else
+            loadingElement.style.display = 'block';
+            
+            try {
+                const [suggestion, explanation] = await getFixSuggestions(formatPrompt(issue), this._userOllamaUrl, "mistral");
+                this.suggestion = suggestion;
+
+                if (suggestion !== 'Error') {
+                    
+                    // Hide loading and show results with controls
+                    loadingElement.style.display = 'none';
+                    aiSuggestion.style.display = 'block';
+                    applyButton.style.display = 'block';
+                    infoIcon.style.display = 'block';
+                    
+                    aiSuggestion.textContent = suggestion;
+                    explanationContent.textContent = explanation;
+
+                    // Add click handler for info icon
+                    infoIcon.onclick = () => {
+                        explanationContent.style.display = 
+                            explanationContent.style.display === 'none' ? 'block' : 'none';
+                    }
+                } else {
+                    loadingElement.style.display = 'none';
+                    aiSuggestion.style.display = 'block';
+                    aiSuggestion.textContent = 'Error getting suggestions. Please try again.';
+                }
+            } catch (error) {
+                console.log(error);
+            }
+        };
+
+        // Add click handlers for the new buttons
         const applyButton = suggestionContainer.querySelector('.jp-A11yPanel-applyButton') as HTMLElement;
         applyButton.onclick = () => {
             this.applySuggestion();
+            suggestionContainer.style.display = 'none';
         };
     
-        const aiSuggestion = suggestionContainer.querySelector('.jp-A11yPanel-suggestion') as HTMLElement;
-        const explanationPopup = suggestionContainer.querySelector('.jp-A11yPanel-explanationPopup') as HTMLElement;
-        const explanationIcon = suggestionContainer.querySelector('.jp-Icon.jp-ChevronIcon') as HTMLElement;
-
-        // Set up the explanation popup toggle
-        explanationIcon.onclick = () => {
-            explanationPopup.classList.toggle('jp-A11yPanel-explanationPopup-visible');
-        };
-
         this.node.appendChild(buttonContainer);
         this.node.appendChild(suggestionContainer);
-
-        console.log(formatPrompt(issue));
-        // Update suggestion when we get the response
-        getFixSuggestions(formatPrompt(issue)).then(([suggestion, explanation]) => {
-            this.suggestion = suggestion; // Store the suggestion
-            aiSuggestion.textContent = suggestion;
-            explanationPopup.textContent = 'AI Explanation: ' +explanation;
-        });
     }
 
     private navigateToCell(index: number): void {
-        const notebook = document.querySelector('.jp-Notebook') as HTMLElement;
-        const cells = notebook?.querySelectorAll('.jp-Cell');
-        const targetCell = cells?.[index] as HTMLElement;
 
-        if (targetCell) {
-            // Scroll to the cell
-            targetCell.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-            // Highlight the cell with a brighter yellow
-            targetCell.style.transition = 'background-color 0.5s ease';
-            targetCell.style.backgroundColor = '#FFFFC5'; // Bright yellow
-
-            // Remove highlight after a short delay
-            setTimeout(() => {
-                targetCell.style.backgroundColor = ''; // Reset to original
-            }, 2000); // Highlight for 2 seconds
+        console.log(index);
+        if (!this.currentNotebook) {
+            console.warn('No active notebook found');
+            return;
         }
+
+        // Use the notebook panel's content directly instead of querying document
+        const cells = this.currentNotebook.content.widgets;
+        const targetCell = cells[index];
+
+        if (!targetCell) {
+            console.warn(`Cell at index ${index} not found`);
+            return;
+        }
+
+        // Scroll the cell into view
+        targetCell.node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+        // Highlight the cell
+        targetCell.node.style.transition = 'background-color 0.5s ease';
+        targetCell.node.style.backgroundColor = '#FFFFC5';
+
+        // Remove highlight after delay
+        setTimeout(() => {
+            targetCell.node.style.backgroundColor = '';
+        }, 2000);
     }
 
     private async applySuggestion(): Promise<void> {
@@ -245,33 +342,10 @@ class CellIssueWidget extends Widget {
         if (cell && cell.model) {
             // Apply the suggestion
             cell.model.sharedModel.setSource(this.suggestion);
-            
-            // Re-analyze the specific cell
-            const tempDiv = document.createElement('div');
-            tempDiv.innerHTML = cell.node.innerHTML;
-            
-            // Not entirely working.
-            try {
-                const results = await axe.run(tempDiv, {
-                    runOnly: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'],
-                    rules: {'button-name': { enabled: false }}
-                });
-                
-                // If no violations found, remove this widget
-                if (results.violations.length === 0) {
-                    this.node.remove(); // Remove from DOM
-                    this.dispose();    // Clean up widget
-                }
-            } finally {
-                tempDiv.remove();
-            }
         }
     }
 }
 
-/**
-* Frontend UI for the main panel.
-*/
 class A11yMainPanel extends Widget {
     constructor() {
         super();
@@ -314,9 +388,16 @@ class A11yMainPanel extends Widget {
         if (!this.currentNotebook) return;
         
         this.issuesContainer.innerHTML = '';
-        
+        console.log('Analyzing current notebook');
         const issues = await analyzeCellsAccessibility(this.currentNotebook);
-        
+        if (issues.length > 0) {
+            console.log(issues.length);
+            issues.forEach(issue => {
+                console.log(issue.axeResults.map(result => result.id).join(', '));
+            });
+        } else {
+            console.log('No issues found');
+        }
         issues.forEach(issue => {
             const issueWidget = new CellIssueWidget(issue, this.currentNotebook!);
             this.issuesContainer.appendChild(issueWidget.node);
@@ -324,6 +405,7 @@ class A11yMainPanel extends Widget {
     }
 }
 
+// Extension Configuration
 const extension: JupyterFrontEndPlugin<void> = {
     id: 'jupyterlab-a11y-fix',
     autoStart: true,

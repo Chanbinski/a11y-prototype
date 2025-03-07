@@ -6,6 +6,7 @@ node_modules/
 .stylelintcache
 *.egg-info/
 test_notebooks/
+sample_notebooks/
 .ipynb_checkpoints
 *.tsbuildinfo
 a11y_prototype/labextension
